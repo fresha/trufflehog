@@ -3,10 +3,12 @@ package docker
 import (
 	"archive/tar"
 	"bytes"
+	stdgzip "compress/gzip"
 	"io"
 	stdlog "log"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -18,6 +20,7 @@ import (
 	"github.com/google/go-containerregistry/pkg/v1/empty"
 	"github.com/google/go-containerregistry/pkg/v1/mutate"
 	"github.com/google/go-containerregistry/pkg/v1/remote"
+	"github.com/google/go-containerregistry/pkg/v1/static"
 	"github.com/google/go-containerregistry/pkg/v1/tarball"
 	"github.com/google/go-containerregistry/pkg/v1/types"
 	"github.com/klauspost/compress/zstd"
@@ -84,70 +87,117 @@ func TestDockerImageScan(t *testing.T) {
 	assert.Equal(t, 1, historyCounter)
 }
 
-// TestDockerImageScanZstdLayer covers https://github.com/trufflesecurity/trufflehog/issues/5561:
-// an image layer compressed with zstd (the media type BuildKit produces with
-// compression=zstd) must be scanned like a gzip layer instead of being
-// skipped with "gzip: invalid header" while the run still exits 0.
-func TestDockerImageScanZstdLayer(t *testing.T) {
-	const testSecret = "zstdlayertestsecret"
+// dockerLayerZstd is the Docker schema 2 media type BuildKit uses for zstd
+// layers when oci-mediatypes=false. go-containerregistry has no constant for it.
+const dockerLayerZstd types.MediaType = "application/vnd.docker.image.rootfs.diff.tar.zstd"
 
-	// Build a tar holding a file with a secret, then compress it with zstd.
-	var tarBuf bytes.Buffer
-	tw := tar.NewWriter(&tarBuf)
-	content := "token=" + testSecret
-	require.NoError(t, tw.WriteHeader(&tar.Header{Name: "secret.txt", Mode: 0o600, Size: int64(len(content))}))
-	_, err := tw.Write([]byte(content))
-	require.NoError(t, err)
-	require.NoError(t, tw.Close())
+// TestDockerImageScanLayerCompression covers https://github.com/trufflesecurity/trufflehog/issues/5561:
+// every layer must be scanned whatever its compression (gzip, zstd or none)
+// and whatever media type it is labelled with, instead of being skipped with
+// "gzip: invalid header" while the run still exits 0.
+func TestDockerImageScanLayerCompression(t *testing.T) {
+	const testSecret = "layercompressiontestsecret"
 
-	var zstdBuf bytes.Buffer
-	zw, err := zstd.NewWriter(&zstdBuf)
+	tests := []struct {
+		name      string
+		mediaType types.MediaType
+		compress  func(t *testing.T, b []byte) []byte
+		tarball   bool // load via file:// (docker save output) instead of a registry
+	}{
+		{name: "gzip docker media type", mediaType: types.DockerLayer, compress: gzipBytes},
+		{name: "zstd oci media type", mediaType: types.OCILayerZStd, compress: zstdBytes},
+		{name: "zstd docker media type", mediaType: dockerLayerZstd, compress: zstdBytes},
+		{name: "uncompressed oci media type", mediaType: types.OCIUncompressedLayer, compress: noCompression},
+		{name: "uncompressed docker media type", mediaType: types.DockerUncompressedLayer, compress: noCompression},
+		// tarball images label every compressed layer as gzip (DockerLayer),
+		// so the media type cannot be trusted for zstd blobs in a docker save.
+		{name: "zstd layer in tarball", mediaType: types.OCILayerZStd, compress: zstdBytes, tarball: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var tarBuf bytes.Buffer
+			tw := tar.NewWriter(&tarBuf)
+			content := "token=" + testSecret
+			require.NoError(t, tw.WriteHeader(&tar.Header{Name: "secret.txt", Mode: 0o600, Size: int64(len(content))}))
+			_, err := tw.Write([]byte(content))
+			require.NoError(t, err)
+			require.NoError(t, tw.Close())
+
+			// static layers serve the bytes exactly as given, so the blob is
+			// compressed (or not) independently of its declared media type.
+			layer := static.NewLayer(tt.compress(t, tarBuf.Bytes()), tt.mediaType)
+			img, err := mutate.Append(empty.Image, mutate.Addendum{
+				Layer:   layer,
+				History: v1.History{CreatedBy: "COPY . /"},
+			})
+			require.NoError(t, err)
+
+			var ref string
+			if tt.tarball {
+				path := filepath.Join(t.TempDir(), "image.tar")
+				tag, err := name.NewTag("test/zstd-image:v1")
+				require.NoError(t, err)
+				require.NoError(t, tarball.WriteToFile(path, tag, img))
+				ref = "file://" + path
+			} else {
+				reg := registry.New(registry.Logger(stdlog.New(io.Discard, "", 0)))
+				srv := httptest.NewServer(reg)
+				t.Cleanup(srv.Close)
+
+				ref = strings.TrimPrefix(srv.URL, "http://") + "/test/compressed-image:v1"
+				tag, err := name.NewTag(ref)
+				require.NoError(t, err)
+				require.NoError(t, remote.Write(tag, img))
+			}
+
+			conn, err := anypb.New(&sourcespb.Docker{
+				Credential: &sourcespb.Docker_Unauthenticated{
+					Unauthenticated: &credentialspb.Unauthenticated{},
+				},
+				Images: []string{ref},
+			})
+			require.NoError(t, err)
+
+			s := &Source{}
+			require.NoError(t, s.Init(context.TODO(), "test layer compression", 1, 1, false, conn, 1))
+
+			chunksChan := make(chan *sources.Chunk, 8)
+			require.NoError(t, s.Chunks(context.TODO(), chunksChan))
+			close(chunksChan)
+
+			found := false
+			for chunk := range chunksChan {
+				if bytes.Contains(chunk.Data, []byte(testSecret)) {
+					found = true
+				}
+			}
+			assert.True(t, found, "expected the secret in the layer to be scanned")
+		})
+	}
+}
+
+func noCompression(_ *testing.T, b []byte) []byte { return b }
+
+func gzipBytes(t *testing.T, b []byte) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	gw := stdgzip.NewWriter(&buf)
+	_, err := gw.Write(b)
 	require.NoError(t, err)
-	_, err = zw.Write(tarBuf.Bytes())
+	require.NoError(t, gw.Close())
+	return buf.Bytes()
+}
+
+func zstdBytes(t *testing.T, b []byte) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	zw, err := zstd.NewWriter(&buf)
+	require.NoError(t, err)
+	_, err = zw.Write(b)
 	require.NoError(t, err)
 	require.NoError(t, zw.Close())
-
-	layer, err := tarball.LayerFromOpener(func() (io.ReadCloser, error) {
-		return io.NopCloser(bytes.NewReader(zstdBuf.Bytes())), nil
-	}, tarball.WithMediaType(types.OCILayerZStd))
-	require.NoError(t, err)
-	img, err := mutate.Append(empty.Image, mutate.Addendum{
-		Layer:   layer,
-		History: v1.History{CreatedBy: "COPY . /"},
-	})
-	require.NoError(t, err)
-
-	reg := registry.New(registry.Logger(stdlog.New(io.Discard, "", 0)))
-	srv := httptest.NewServer(reg)
-	t.Cleanup(srv.Close)
-
-	ref := strings.TrimPrefix(srv.URL, "http://") + "/test/zstd-image:v1"
-	tag, err := name.NewTag(ref)
-	require.NoError(t, err)
-	require.NoError(t, remote.Write(tag, img))
-
-	conn, err := anypb.New(&sourcespb.Docker{
-		Credential: &sourcespb.Docker_Unauthenticated{
-			Unauthenticated: &credentialspb.Unauthenticated{},
-		},
-		Images: []string{ref},
-	})
-	require.NoError(t, err)
-
-	s := &Source{}
-	require.NoError(t, s.Init(context.TODO(), "test zstd layer", 1, 1, false, conn, 1))
-
-	chunksChan := make(chan *sources.Chunk, 8)
-	require.NoError(t, s.Chunks(context.TODO(), chunksChan))
-	close(chunksChan)
-
-	found := false
-	for chunk := range chunksChan {
-		if bytes.Contains(chunk.Data, []byte(testSecret)) {
-			found = true
-		}
-	}
-	assert.True(t, found, "expected the secret in the zstd layer to be scanned")
+	return buf.Bytes()
 }
 
 func TestQuayRegistry(t *testing.T) {

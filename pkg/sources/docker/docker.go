@@ -2,6 +2,8 @@ package docker
 
 import (
 	"archive/tar"
+	"bufio"
+	"bytes"
 	"errors"
 	"fmt"
 	"io"
@@ -11,12 +13,12 @@ import (
 	"time"
 
 	"github.com/google/go-containerregistry/pkg/authn"
+	"github.com/google/go-containerregistry/pkg/compression"
 	"github.com/google/go-containerregistry/pkg/name"
 	v1 "github.com/google/go-containerregistry/pkg/v1"
 	"github.com/google/go-containerregistry/pkg/v1/daemon"
 	"github.com/google/go-containerregistry/pkg/v1/remote"
 	"github.com/google/go-containerregistry/pkg/v1/tarball"
-	"github.com/google/go-containerregistry/pkg/v1/types"
 	"github.com/klauspost/compress/zstd"
 	gzip "github.com/klauspost/pgzip"
 	"golang.org/x/sync/errgroup"
@@ -411,38 +413,17 @@ func (s *Source) processLayer(ctx context.Context, layer v1.Layer, imgInfo image
 	}
 	defer func() { _ = rc.Close() }()
 
-	mediaType, err := layer.MediaType()
+	// Layers are tar archives, usually compressed. Pick the decompressor from
+	// the stream's magic bytes rather than the layer's media type: BuildKit
+	// emits zstd under both OCI and Docker media types, layers may be
+	// uncompressed, and tarball (docker save) images label every compressed
+	// layer as gzip regardless of its real compression.
+	tarStream, closeStream, err := decompressLayer(rc)
 	if err != nil {
-		return err
+		mediaType, _ := layer.MediaType()
+		return fmt.Errorf("decompressing layer (media type %q): %w", mediaType, err)
 	}
-
-	// Configure parallel gzip decompression for better performance
-	const (
-		defaultBlockSize = 1 << 24 // 16MB blocks
-		defaultBlocks    = 8       // Process 8 blocks in parallel
-	)
-
-	// Layers are tar archives, so we read them as tar files. BuildKit can
-	// produce zstd-compressed layers (application/vnd.oci.image.layer.v1.tar+zstd),
-	// which pgzip cannot read, so decompress those with a zstd reader and keep
-	// parallel gzip decompression for gzip layers.
-	var tarStream io.Reader
-	switch mediaType {
-	case types.OCILayerZStd:
-		zstdReader, err := zstd.NewReader(rc)
-		if err != nil {
-			return err
-		}
-		defer func() { zstdReader.Close() }()
-		tarStream = zstdReader
-	default:
-		gzipReader, err := gzip.NewReaderN(rc, defaultBlockSize, defaultBlocks)
-		if err != nil {
-			return err
-		}
-		defer func() { _ = gzipReader.Close() }()
-		tarStream = gzipReader
-	}
+	defer closeStream()
 
 	tarReader := tar.NewReader(tarStream)
 	var files, skipped int
@@ -468,6 +449,66 @@ func (s *Source) processLayer(ctx context.Context, layer v1.Layer, imgInfo image
 
 	ctx.Logger().V(3).Info("Finished scanning layer", "files", files, "skipped", skipped, "duration", time.Since(start))
 	return nil
+}
+
+var (
+	gzipMagic = []byte{0x1f, 0x8b}
+	zstdMagic = []byte{0x28, 0xb5, 0x2f, 0xfd}
+)
+
+// peekCompression reports the compression of r from its magic bytes, the
+// same detection go-containerregistry's (internal) compression.PeekCompression
+// does for layer.Uncompressed(). The returned reader replays the peeked bytes.
+func peekCompression(r io.Reader) (compression.Compression, io.Reader, error) {
+	br := bufio.NewReader(r)
+	// A short or empty blob is treated as uncompressed; the tar reader reports it.
+	magic, err := br.Peek(len(zstdMagic))
+	if err != nil && !errors.Is(err, io.EOF) {
+		return compression.None, br, err
+	}
+
+	switch {
+	case bytes.HasPrefix(magic, gzipMagic):
+		return compression.GZip, br, nil
+	case bytes.HasPrefix(magic, zstdMagic):
+		return compression.ZStd, br, nil
+	default:
+		return compression.None, br, nil
+	}
+}
+
+// decompressLayer detects a layer blob's compression the way
+// layer.Uncompressed() does, but decompresses gzip with pgzip's parallel
+// read-ahead instead of the standard library. The returned func releases the
+// decompressor; it does not close r.
+func decompressLayer(r io.Reader) (io.Reader, func(), error) {
+	// Configure parallel gzip decompression for better performance
+	const (
+		defaultBlockSize = 1 << 24 // 16MB blocks
+		defaultBlocks    = 8       // Process 8 blocks in parallel
+	)
+
+	cp, pr, err := peekCompression(r)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	switch cp {
+	case compression.GZip:
+		gzipReader, err := gzip.NewReaderN(pr, defaultBlockSize, defaultBlocks)
+		if err != nil {
+			return nil, nil, err
+		}
+		return gzipReader, func() { _ = gzipReader.Close() }, nil
+	case compression.ZStd:
+		zstdReader, err := zstd.NewReader(pr)
+		if err != nil {
+			return nil, nil, err
+		}
+		return zstdReader, zstdReader.Close, nil
+	default:
+		return pr, func() {}, nil
+	}
 }
 
 // chunkProcessingInfo holds information needed to process a single file from a layer
