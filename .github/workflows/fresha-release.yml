@@ -1,0 +1,113 @@
+# Fresha internal build of TruffleHog.
+#
+# Upstream's workflows are removed on Fresha release branches: their release
+# workflow also triggers on v* tags and would publish to TruffleHog's
+# DockerHub, GHCR and Homebrew tap with secrets this repository does not have.
+#
+# Tag a release branch with vX.Y.Z-fresha.N to publish linux amd64/arm64
+# archives named like upstream's (trufflehog_<version>_linux_<arch>.tar.gz,
+# binary at the archive root) plus a checksums file, so
+# platform-tribe-actions' verified-download can fetch them unchanged.
+name: Fresha release
+
+on:
+  push:
+    tags:
+      - "v*-fresha.*"
+
+permissions: {}
+
+concurrency:
+  group: fresha-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version-file: go.mod
+          # No build cache in a release job: a cache written by another
+          # workflow could poison the published binaries.
+          cache: false
+
+      - name: Resolve version
+        id: version
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          # No leading v: platform-tribe-actions' secret scan reads the version
+          # from the scan log with a pattern that starts at the first digit.
+          version="${TAG#v}"
+          if ! [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+-fresha\.[0-9]+$ ]]; then
+            echo "::error::tag $TAG is not vX.Y.Z-fresha.N"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Test the docker source
+        run: >-
+          go test ./pkg/sources/docker/
+          -run 'TestDockerImageScanLayerCompression|TestDockerImageScan$|TestSource_DebugLogging|TestBaseAndTagFromImage'
+          -count=1
+
+      - name: Build
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          for arch in amd64 arm64; do
+            out="build/linux_${arch}"
+            mkdir -p "$out"
+            GOOS=linux GOARCH="$arch" CGO_ENABLED=0 go build -trimpath \
+              -ldflags "-s -w -X 'github.com/trufflesecurity/trufflehog/v3/pkg/version.BuildVersion=${VERSION}'" \
+              -o "$out/trufflehog" .
+            cp LICENSE README.md "$out/"
+            tar -C "$out" -czf "dist/trufflehog_${VERSION}_linux_${arch}.tar.gz" trufflehog LICENSE README.md
+          done
+          (cd dist && sha256sum ./*.tar.gz | sed 's# \./# #' > "trufflehog_${VERSION}_checksums.txt")
+          cat "dist/trufflehog_${VERSION}_checksums.txt"
+
+      - name: Check the built version
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          reported="$(./build/linux_amd64/trufflehog --no-update --version 2>&1)"
+          echo "$reported"
+          if [[ "$reported" != *"$VERSION"* ]]; then
+            echo "::error::built binary reports '$reported', expected $VERSION"
+            exit 1
+          fi
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          upstream="v${VERSION%-fresha.*}"
+          notes="Fresha internal build of TruffleHog ${upstream} at ${GITHUB_SHA}.
+
+          Changes on top of upstream: https://github.com/trufflesecurity/trufflehog/compare/${upstream}...${GITHUB_REPOSITORY_OWNER}:trufflehog:${GITHUB_SHA}
+
+          SHA-256:
+          $(cat "dist/trufflehog_${VERSION}_checksums.txt")"
+          gh release create "$TAG" dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "$TAG" \
+            --notes "$notes" \
+            --verify-tag \
+            --latest=false
